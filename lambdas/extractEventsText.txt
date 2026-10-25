@@ -1,0 +1,267 @@
+import csv
+import io
+import json
+from datetime import datetime, timezone
+
+import boto3
+from botocore.exceptions import ClientError
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+glue_client = boto3.client('glue')
+
+BUCKET_NAME = "aws-vct"
+database_name = "aws_vct"
+
+
+def to_athena_ts(wall_time):
+    """
+    Convert an ISO 8601 string like '2023-05-21T16:04:46.555Z' into the format
+    Athena reads as a timestamp: 'yyyy-MM-dd HH:mm:ss.SSS' (UTC).
+    Returns an empty string (-> NULL in Athena) if the value is missing or unparseable.
+    """
+    if not wall_time:
+        return ""
+    try:
+        s = str(wall_time).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            # Handles fractional seconds that aren't exactly 3 or 6 digits
+            base, _, rest = s.partition(".")
+            frac = ""
+            tz = ""
+            for i, ch in enumerate(rest):
+                if not ch.isdigit():
+                    frac, tz = rest[:i], rest[i:]
+                    break
+            else:
+                frac = rest
+            frac = (frac + "000000")[:6]
+            dt = datetime.fromisoformat(f"{base}.{frac}{tz}")
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    except Exception as e:
+        print(f"Could not parse wallTime '{wall_time}': {e}")
+        return ""
+
+
+def get_json_from_s3(bucket, key):
+    """Reads and parses a JSON file from S3. Returns None if key does not exist."""
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        return json.loads(response['Body'].read().decode('utf-8'))
+    except ClientError as e:
+        if e.response['Error']['Code'] in ('NoSuchKey', '404'):
+            return None
+        raise e
+
+
+def put_text_to_s3(bucket, key, content, table_name, createPartition=False):
+    """Writes text content to S3."""
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=content,
+        ContentType='text/plain'
+    )
+    if createPartition == True:
+        print("KEY IS " + key)
+        league = key.rsplit("/", -1)[3].replace("league=", "")
+        year = key.rsplit("/", -1)[4].replace("year=", "")
+        partition_values = [league, year]
+        partition_folder = key.rsplit("/", 1)[0]
+        partition_location = f"s3://{BUCKET_NAME}/{partition_folder}/"
+        partition_input = {
+            "Values": partition_values,
+            "StorageDescriptor": {
+                "Location": partition_location,
+                "InputFormat": "org.apache.hadoop.mapred.TextInputFormat",
+                "OutputFormat": "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+                "Compressed": False,
+                "NumberOfBuckets": 0,
+                "SerdeInfo": {
+                    "SerializationLibrary": "org.apache.hadoop.hive.serde2.OpenCSVSerde",
+                    "Parameters": {"separatorChar": ","},
+                }
+            },
+        }
+        try:
+            glue_client.create_partition(
+                DatabaseName=database_name, TableName=table_name, PartitionInput=partition_input)
+
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "AlreadyExistsException":
+                print("Partition already exists. Skipping insertion safely.")
+            else:
+                # Re-raise any other unexpected AWS errors (e.g., EntityNotFoundException)
+                raise e
+
+
+def process_game(league, year, game_id, json_base_prefix):
+    print(f"Processing game ID: {game_id}")
+
+    # 1. Configuration Table
+    conf_key = f"{json_base_prefix}/{game_id}:configuration.json"
+    conf_events = get_json_from_s3(BUCKET_NAME, conf_key)
+    if conf_events:
+        event = conf_events[0]
+        platform_id = event['platformGameId']
+        wallTime = to_athena_ts(event['metadata']['wallTime'])
+        lines = ["platform_id,wallTime,team_key,player_key"]
+        for team in event['configuration']['teams']:
+            team_id = team['teamId']['value']
+            players = [p["value"] for p in team["playersInTeam"]]
+            for player in players:
+                lines.append(f"{platform_id},{wallTime},{team_id},{player}")
+        target_key = f"eventsData/text/configuration/league={league}/year={year}/{game_id}:configuration.txt"
+        put_text_to_s3(BUCKET_NAME, target_key, "\n".join(lines) + "\n", "")
+
+    # 2. Rounds Started Table
+    started_key = f"{json_base_prefix}/{game_id}:roundStarted.json"
+    started_events = get_json_from_s3(BUCKET_NAME, started_key)
+    if started_events:
+        platform_id = started_events[0]['platformGameId']
+        lines = ["platform_id,roundNumber,attackingTeam,defendingTeam,round_status,winning_team,cause,wallTime"]
+        for event in started_events:
+            roundStarted = event['roundStarted']
+            roundNumber = roundStarted['roundNumber']
+            attackingTeam = roundStarted['spikeMode']['attackingTeam']['value']
+            defendingTeam = roundStarted['spikeMode']['defendingTeam']['value']
+            round_status = "STARTED"
+            winning_team = ""
+            cause = ""
+            wallTime = to_athena_ts(event['metadata']['wallTime'])
+            lines.append(f"{platform_id},{roundNumber},{attackingTeam},{defendingTeam},{round_status},{winning_team},{cause},{wallTime}")
+        target_key = f"eventsData/text/rounds_started/league={league}/year={year}/{game_id}:rounds_started.txt"
+        put_text_to_s3(BUCKET_NAME, target_key, "\n".join(lines) + "\n", "")
+
+    # 3. Rounds Decided Table
+    decided_key = f"{json_base_prefix}/{game_id}:roundDecided.json"
+    decided_events = get_json_from_s3(BUCKET_NAME, decided_key)
+    if decided_events:
+        platform_id = decided_events[0]['platformGameId']
+        lines = ["platform_id,roundNumber,attackingTeam,defendingTeam,round_status,winning_team,cause,wallTime"]
+        for event in decided_events:
+            result = event['roundDecided']['result']
+            roundNumber = result['roundNumber']
+            attackingTeam = result['spikeModeResult']['attackingTeam']['value']
+            defendingTeam = result['spikeModeResult']['defendingTeam']['value']
+            round_status = "DECIDED"
+            winning_team = result['winningTeam']['value']
+            cause = result['spikeModeResult']['cause']
+            wallTime = to_athena_ts(event['metadata']['wallTime'])
+            lines.append(f"{platform_id},{roundNumber},{attackingTeam},{defendingTeam},{round_status},{winning_team},{cause},{wallTime}")
+        target_key = f"eventsData/text/rounds_decided/league={league}/year={year}/{game_id}:rounds_decided.txt"
+        put_text_to_s3(BUCKET_NAME, target_key, "\n".join(lines) + "\n", "")
+
+    # 4. Spike Status Table
+    spike_key = f"{json_base_prefix}/{game_id}:spikeStatus.json"
+    spike_events = get_json_from_s3(BUCKET_NAME, spike_key)
+    if spike_events:
+        platform_id = spike_events[0]['platformGameId']
+        lines = ["platform_id,roundNumber,spike_status,carrier,wallTime"]
+        for event in spike_events:
+            spikeStatus = event['spikeStatus']['status']
+            roundNumber = ""
+            carrier = event['spikeStatus']['carrier']['value'] if spikeStatus == "IN_HANDS" else ""
+            wallTime = to_athena_ts(event['metadata']['wallTime'])
+            lines.append(f"{platform_id},{roundNumber},{spikeStatus},{carrier},{wallTime}")
+        target_key = f"eventsData/text/spikeStatus/league={league}/year={year}/{game_id}:spikeStatus.txt"
+        put_text_to_s3(BUCKET_NAME, target_key, "\n".join(lines) + "\n", "")
+
+    # 5. Damage Event Table
+    damage_key = f"{json_base_prefix}/{game_id}:damageEvent.json"
+    damage_events = get_json_from_s3(BUCKET_NAME, damage_key)
+    if damage_events:
+        platform_id = damage_events[0]['platformGameId']
+        lines = ["platform_id,roundNumber,damage_location,causer_id,victim_id,damage_amount,kill_event,wallTime"]
+        for event in damage_events:
+            damageEvent = event['damageEvent']
+            damage_location = damageEvent['location']
+            roundNumber = ""
+            causer_id = damageEvent['causerId']['value']
+            victim_id = damageEvent['victimId']['value']
+            damage_amount = damageEvent['damageAmount']
+            kill_event = damageEvent['killEvent']
+            wallTime = to_athena_ts(event['metadata']['wallTime'])
+            lines.append(f"{platform_id},{roundNumber},{damage_location},{causer_id},{victim_id},{damage_amount},{kill_event},{wallTime}")
+        target_key = f"eventsData/text/damageEvent/league={league}/year={year}/{game_id}:damageEvent.txt"
+        put_text_to_s3(BUCKET_NAME, target_key, "\n".join(lines) + "\n", "game_damage_event", True)
+
+    # 6. Player Died Table
+    died_key = f"{json_base_prefix}/{game_id}:playerDied.json"
+    died_events = get_json_from_s3(BUCKET_NAME, died_key)
+    if died_events:
+        platform_id = died_events[0]['platformGameId']
+        output_buffer = io.StringIO()
+        writer = csv.writer(output_buffer, quoting=csv.QUOTE_NONE, escapechar="\\")
+        writer.writerow(["platform_id", "roundNumber", "deceased_id", "killer_id", "assistants", "wallTime"])
+
+        for event in died_events:
+            playerDied = event['playerDied']
+            deceased_id = playerDied['deceasedId']['value']
+            roundNumber = ""
+            killer_id = playerDied['killerId']['value']
+            assistants = [p["assistantId"]['value'] for p in playerDied["assistants"]]
+            assistants_pg = "{" + ",".join(str(x) for x in assistants) + "}"
+            wallTime = to_athena_ts(event['metadata']['wallTime'])
+
+            writer.writerow([platform_id, roundNumber, deceased_id, killer_id, assistants_pg, wallTime])
+
+        target_key = f"eventsData/text/playerDied/league={league}/year={year}/{game_id}:playerDied.txt"
+        put_text_to_s3(BUCKET_NAME, target_key, output_buffer.getvalue(), "")
+
+    # 7. Game Decided Table
+    game_decided_key = f"{json_base_prefix}/{game_id}:gameDecided.json"
+    game_decided_events = get_json_from_s3(BUCKET_NAME, game_decided_key)
+    if game_decided_events:
+        platform_id = game_decided_events[0]['platformGameId']
+        lines = ["platform_id,winning_round_number,attacking_team,defending_team,game_state,winning_team,wallTime"]
+        for event in game_decided_events:
+            gameDecided = event['gameDecided']
+            attacking_team = gameDecided['spikeMode']['attackingTeam']['value']
+            defending_team = gameDecided['spikeMode']['defendingTeam']['value']
+            winning_round_number = gameDecided['spikeMode']['currentRound']
+            game_state = gameDecided['state']
+            winning_team = gameDecided['winningTeam']['value']
+            wallTime = to_athena_ts(event['metadata']['wallTime'])
+            lines.append(f"{platform_id},{winning_round_number},{attacking_team},{defending_team},{game_state},{winning_team},{wallTime}")
+        target_key = f"eventsData/text/gameDecided/league={league}/year={year}/{game_id}:gameDecided.txt"
+        put_text_to_s3(BUCKET_NAME, target_key, "\n".join(lines) + "\n", "game_game_decided_event", True)
+
+
+def lambda_handler(event, context):
+    print(event)
+    path = event['detail']['message'].replace("Json Extracted : ", "")
+    league = path.split("/", -1)[1]
+    YEAR = path.split("/", -1)[3]
+    game_id = path.split("/", -1)[4].rsplit(".")[0]
+    json_base_prefix = f"eventsData/json/league={league}/year={YEAR}"
+    try:
+        process_game(league, YEAR, game_id, json_base_prefix)
+        client = boto3.client('events')
+        client.put_events(
+            Entries=[
+                {
+                    'Source': 'extract.events.text',
+                    'DetailType': 'Text Events Extraction',
+                    'Detail': json.dumps({'message': f"Text Extracted : {path}"}),
+                    'EventBusName': 'default',
+                },
+            ]
+        )
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Event text tables generation complete!')
+        }
+    except Exception as e:
+        print(f"Error processing game {game_id}: {str(e)}")
+
+    return {
+        'statusCode': 500,
+        'body': json.dumps('Event text tables generation failed!')
+    }

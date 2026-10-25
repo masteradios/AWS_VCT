@@ -1,0 +1,150 @@
+
+
+
+-- ============================================================================
+-- 1. game_damage_event
+
+-- ============================================================================
+CREATE EXTERNAL TABLE aws_vct.game_damage_event (
+  platformgameid string,
+  roundnumber string,
+  damage_location string,
+  causer_id string,
+  victim_id string,
+  damage_amount string,
+  kill_event string,
+  walltime string
+)
+PARTITIONED BY (
+  league string,
+  year int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES ('separatorChar' = ',')
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://aws-vct/eventsData/text/damageEvent_updated/'
+TBLPROPERTIES ('classification' = 'csv','skip.header.line.count'='1');
+
+
+-- ============================================================================
+-- 2. game_game_decided_event
+-- ============================================================================
+CREATE EXTERNAL TABLE aws_vct.game_game_decided_event (
+  platformgameid string,
+  winning_round_number string,
+  attacking_team string,
+  defending_team string,
+  game_state string,
+  winning_team string,
+  walltime string
+)
+PARTITIONED BY (
+  league string,
+  year int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES ('separatorChar' = ',')
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://aws-vct/eventsData/text/gameDecided/'
+TBLPROPERTIES ('classification' = 'csv', 'skip.header.line.count' = '1');
+
+
+-- ============================================================================
+-- 3. game_player_died_event
+
+-- ============================================================================
+CREATE EXTERNAL TABLE aws_vct.game_player_died_event (
+  platformgameid string,
+  roundnumber string,
+  deceased_id string,
+  killer_id string,
+  assistants string,
+  walltime string
+)
+PARTITIONED BY (
+  league string,
+  year int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES ('separatorChar' = ',')
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://aws-vct/eventsData/text/playerDied_updated/'
+TBLPROPERTIES ('classification' = 'csv','skip.header.line.count'='1');
+
+
+-- ============================================================================
+-- 4. game_players_event
+-- ============================================================================
+CREATE EXTERNAL TABLE aws_vct.game_players_event (
+  platformgameid string,
+  walltime string,
+  team_key string,
+  player_key string,
+  player_id string,
+  handle string,
+  first_name string,
+  last_name string,
+  home_team_id string,
+  current_game_team_id string,
+  team_name string
+)
+PARTITIONED BY (
+  league string,
+  year int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES ('separatorChar' = ',')
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://aws-vct/eventsData/text/game_players_event/'
+TBLPROPERTIES ('classification' = 'csv','skip.header.line.count'='1');
+
+
+-- ============================================================================
+-- 5. game_rounds_event
+-- ============================================================================
+CREATE EXTERNAL TABLE aws_vct.game_rounds_event (
+  platformgameid string,
+  roundnumber string,
+  attackingteam string,
+  defendingteam string,
+  round_status string,
+  winning_team string,
+  cause string,
+  walltime string
+)
+PARTITIONED BY (
+  league string,
+  year int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES ('separatorChar' = ',')
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://aws-vct/eventsData/text/roundsEventUpdated/'
+TBLPROPERTIES ('classification' = 'csv','skip.header.line.count'='1');
+
+
+-- ============================================================================
+-- 6. game_spike_status_event
+-- ============================================================================
+CREATE EXTERNAL TABLE aws_vct.game_spike_status_event (
+  platformgameid string,
+  roundnumber string,
+  spike_status string,
+  carrier string,
+  walltime string
+)
+PARTITIONED BY (
+  league string,
+  year int
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES ('separatorChar' = ',')
+STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat'
+OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+LOCATION 's3://aws-vct/eventsData/text/spikeStatus_updated/'
+TBLPROPERTIES ('classification' = 'csv','skip.header.line.count'='1');

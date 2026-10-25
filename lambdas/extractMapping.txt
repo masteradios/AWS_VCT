@@ -1,0 +1,138 @@
+import json
+import io
+import boto3
+import pandas as pd
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+
+BUCKET_NAME = "aws-vct"
+LEAGUES = ['game-changers',
+ #'vct-international', 'vct-challengers'
+ ]
+
+
+def read_json_from_s3(bucket, key):
+    """Reads a JSON file directly from S3 into a Pandas DataFrame."""
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    return pd.read_json(io.BytesIO(response['Body'].read()), dtype=False)
+
+
+def write_csv_to_s3(df, bucket, key):
+    """Writes a Pandas DataFrame as a CSV file directly to S3."""
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=csv_buffer.getvalue(),
+        ContentType='text/csv'
+    )
+    print(f"Uploaded: s3://{bucket}/{key}")
+
+
+def extract_team_key_and_value(row):
+    results = []
+    if isinstance(row.get('teamMapping'), dict):
+        for key, value in row.teamMapping.items():
+            results.append({
+                "platformGameId": row.platformGameId,
+                "teamKey": key,
+                "teamId": value
+            })
+    return results
+
+
+def extract_player_key_and_value(row):
+    results = []
+    if isinstance(row.get('participantMapping'), dict):
+        for key, value in row.participantMapping.items():
+            results.append({
+                "platformGameId": row.platformGameId,
+                "playerKey": key,
+                "playerId": value
+            })
+    return results
+
+
+def process_league(league):
+    input_prefix = f"rawData/{league}/esports-data"
+    output_prefix = f"intermediateData/{league}/esports-data"
+
+    print(f"Starting processing for league: {league}")
+
+    # 1. Read JSON files from S3
+    tournaments_df = read_json_from_s3(BUCKET_NAME, f"{input_prefix}/tournaments.json")
+    leagues_df = read_json_from_s3(BUCKET_NAME, f"{input_prefix}/leagues.json")[['league_id', 'name']]
+    mapping_df = read_json_from_s3(BUCKET_NAME, f"{input_prefix}/mapping_data.json")[
+        ['platformGameId', 'teamMapping', 'participantMapping', 'tournamentId']
+    ]
+    teams_json_df = read_json_from_s3(BUCKET_NAME, f"{input_prefix}/teams.json")
+
+    # 2. Extract mappings for Teams and Players
+    teams_list = [item for sublist in mapping_df.apply(extract_team_key_and_value, axis=1) for item in sublist]
+    teams_df = pd.DataFrame(teams_list)
+
+    players_list = [item for sublist in mapping_df.apply(extract_player_key_and_value, axis=1) for item in sublist]
+    players_df = pd.DataFrame(players_list)
+
+    # 3. Process & Merge Games Data
+    games_df = mapping_df[['platformGameId', 'tournamentId']]
+    games_enriched = (
+        pd.merge(
+            games_df, 
+            tournaments_df,
+            left_on='tournamentId',
+            right_on='id',
+            how='left'
+        )
+        .rename(columns={"name": "tournament_name"})
+        .merge(
+            leagues_df,
+            how="left",
+            on="league_id"
+        )
+        .rename(columns={"name": "league_name"})
+        [['platformGameId', 'tournamentId', 'league_id', 'tournament_name', 'league_name']]
+    )
+
+    # 4. Process & Enrich Teams Data
+    teams_json_clean = teams_json_df.drop_duplicates(['id'])
+    teams_enriched = (
+        pd.merge(
+            teams_df, 
+            teams_json_clean,
+            left_on='teamId',
+            right_on='id',
+            how='left'
+        )
+        .drop(columns=['acronym', 'home_league_id', 'dark_logo_url', 'light_logo_url', 'slug', 'id'], errors='ignore')
+        .rename(columns={"name": "team_name"})
+    )
+
+    # 5. Write enriched output CSVs to S3
+    write_csv_to_s3(teams_enriched, BUCKET_NAME, f"{output_prefix}/teams.csv")
+    write_csv_to_s3(players_df, BUCKET_NAME, f"{output_prefix}/players.csv")
+    write_csv_to_s3(games_enriched, BUCKET_NAME, f"{output_prefix}/games.csv")
+
+
+def lambda_handler(event, context):
+    for league in LEAGUES:
+        try:
+            process_league(league)
+        except Exception as e:
+            print(f"Error processing league {league}: {str(e)}")
+            raise e
+
+    
+    s3_client.put_object(
+                    Bucket=BUCKET_NAME,
+                    Key=f"intermediateData/{league}/esports-data/.success.extractMapping",
+                    Body=b"",
+                    ContentType='application/json'
+                )
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('All leagues processed and exported successfully!')
+    }

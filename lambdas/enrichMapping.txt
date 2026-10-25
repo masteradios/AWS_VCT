@@ -1,0 +1,125 @@
+import json
+import io
+import boto3
+import pandas as pd
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+
+BUCKET_NAME = "aws-vct"
+LEAGUES = ['game-changers',
+# 'vct-international', 'vct-challengers'
+]
+
+
+def read_json_from_s3(bucket, key, dtype=None):
+    """Reads a JSON file directly from S3 into a Pandas DataFrame."""
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    return pd.read_json(io.BytesIO(response['Body'].read()), dtype=dtype)
+
+
+def read_csv_from_s3(bucket, key, dtype=None):
+    """Reads a CSV file directly from S3 into a Pandas DataFrame."""
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    return pd.read_csv(io.BytesIO(response['Body'].read()), dtype=dtype)
+
+
+def write_csv_to_s3(df, bucket, key):
+    """Writes a Pandas DataFrame as a CSV file directly to S3."""
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=csv_buffer.getvalue(),
+        ContentType='text/csv'
+    )
+    print(f"Uploaded: s3://{bucket}/{key}")
+
+
+def delete_s3_object(bucket, key):
+    """Deletes an object from S3."""
+    s3_client.delete_object(Bucket=bucket, Key=key)
+    print(f"Deleted: s3://{bucket}/{key}")
+
+
+def process_enrichment(league):
+    lookup_prefix = f"rawData/{league}/esports-data"
+    main_prefix = f"intermediateData/{league}/esports-data"
+
+    print(f"Processing enrichment for league: {league}")
+
+    # 1. Team Enrichment
+    teams_json = read_json_from_s3(
+        BUCKET_NAME, f"{lookup_prefix}/teams.json", dtype={"id": "str"}
+    ).drop_duplicates(['id'])
+    
+    teams_csv = read_csv_from_s3(
+        BUCKET_NAME, f"{main_prefix}/teams.csv", dtype={"teamId": "str"}
+    )
+    
+    teams_enriched = (
+        pd.merge(
+            teams_csv, 
+            teams_json,
+            left_on='teamId',
+            right_on='id',
+            how='left'
+        )
+        .drop(
+            columns=['acronym', 'home_league_id', 'dark_logo_url', 'light_logo_url', 'slug', 'id'],
+            errors='ignore'
+        )
+        .rename(columns={"name": "team_name"})
+    )
+    teams_enriched['league'] = league
+    write_csv_to_s3(teams_enriched, BUCKET_NAME, f"{main_prefix}/teams_enriched.csv")
+
+    # 2. Player Enrichment
+    players_json = read_json_from_s3(
+        BUCKET_NAME, f"{lookup_prefix}/players.json"
+    ).drop_duplicates(['id']).astype(str)
+    
+    players_csv = read_csv_from_s3(
+        BUCKET_NAME, f"{main_prefix}/players.csv"
+    ).astype(str)
+    
+    players_enriched = (
+        pd.merge(
+            players_csv, 
+            players_json,
+            left_on='playerId',
+            right_on='id',
+            how='left'
+        )
+        .drop(
+            columns=['status', 'photo_url', 'created_at', 'updated_at', 'id'],
+            errors='ignore'
+        )
+    )
+    players_enriched['league'] = league
+    write_csv_to_s3(players_enriched, BUCKET_NAME, f"{main_prefix}/players_enriched.csv")
+
+    # 3. Cleanup original CSVs (replaces os.remove)
+    delete_s3_object(BUCKET_NAME, f"{main_prefix}/teams.csv")
+    delete_s3_object(BUCKET_NAME, f"{main_prefix}/players.csv")
+
+
+def lambda_handler(event, context):
+    for league in LEAGUES:
+        try:
+            process_enrichment(league)
+        except Exception as e:
+            print(f"Error enriching data for league {league}: {str(e)}")
+            raise e
+
+    s3_client.put_object(
+                    Bucket=BUCKET_NAME,
+                    Key=f"intermediateData/{league}/esports-data/.success.enrichMapping",
+                    Body=b"",
+                    ContentType='application/json'
+                )
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Data enrichment completed and original CSV files cleaned up!')
+    }

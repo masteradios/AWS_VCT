@@ -1,0 +1,338 @@
+import csv
+import io
+import json
+import re
+import boto3
+import numpy as np
+import pandas as pd
+from botocore.exceptions import ClientError
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+
+BUCKET_NAME = "aws-vct"
+
+
+glue_client = boto3.client("glue")
+
+database_name = "aws_vct"
+
+# Athena-readable timestamp format: yyyy-MM-dd HH:mm:ss.SSS (UTC)
+ATHENA_TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+
+# ---------------------------------------------------------------------------
+# Partition storage descriptors (SerDe is set PER PARTITION, and it overrides
+# the table-level SerDe, so it must match what the Athena table expects).
+# ---------------------------------------------------------------------------
+TEXT_INPUT_FORMAT = "org.apache.hadoop.mapred.TextInputFormat"
+TEXT_OUTPUT_FORMAT = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+
+# Default: all columns are strings
+OPENCSV_SERDE = {
+    "SerializationLibrary": "org.apache.hadoop.hive.serde2.OpenCSVSerde",
+    "Parameters": {"separatorChar": ","},
+}
+
+# For tables that contain an array<...> column. Arrays are items joined by "|".
+# Fields are not quoted (files are written with QUOTE_NONE + backslash escape).
+ARRAY_DELIM = "|"
+LAZY_ARRAY_SERDE = {
+    "SerializationLibrary": "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+    "Parameters": {
+        "field.delim": ",",
+        "collection.delim": ARRAY_DELIM,
+        "escape.delim": "\\",
+        "serialization.format": ",",
+    },
+}
+
+# Tables that need the array-capable SerDe
+ARRAY_TABLES = set()
+
+
+def normalize_walltime(df, col="wallTime"):
+    """
+    Return a copy of df where `col` is a string in Athena's timestamp format
+    'yyyy-MM-dd HH:mm:ss.SSS' (UTC). Accepts ISO strings ('...T...Z'), the Athena
+    format itself, or datetime64 (naive or tz-aware). Unparseable -> empty (NULL).
+    """
+    if col not in df.columns:
+        return df
+    df = df.copy()
+    ts = pd.to_datetime(df[col], format="ISO8601", utc=True, errors="coerce")
+    df[col] = ts.dt.strftime(ATHENA_TS_FORMAT).str[:-3]
+    return df
+
+
+def read_csv_from_s3(bucket, key, dtype=None, quoting=0, escapechar=None):
+    """Reads a CSV file directly from S3 into a Pandas DataFrame with support for custom quoting/escaping."""
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        return pd.read_csv(
+            io.BytesIO(response['Body'].read()),
+            dtype=dtype,
+            quoting=quoting,
+            escapechar=escapechar
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] in ('NoSuchKey', '404'):
+            return None
+        raise e
+
+
+def write_df_to_s3(df, bucket, key, table_name, quoting=csv.QUOTE_MINIMAL, escapechar=None):
+    """Writes a Pandas DataFrame as a CSV directly to S3 and registers the Glue partition."""
+    # Make sure wallTime is always written as 'yyyy-MM-dd HH:mm:ss.SSS'
+    df = normalize_walltime(df, "wallTime")
+
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False, quoting=quoting, escapechar=escapechar, header=True)
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=csv_buffer.getvalue(),
+        ContentType='text/csv'
+    )
+    print("KEY IS " + key)
+
+    parts = key.split("/")
+    league = parts[3].replace("league=", "")
+    year = parts[4].replace("year=", "")
+    partition_values = [league, year]
+
+
+    partition_folder = key.rsplit("/", 1)[0]
+    partition_location = f"s3://{bucket}/{partition_folder}/"
+
+    serde = LAZY_ARRAY_SERDE if table_name in ARRAY_TABLES else OPENCSV_SERDE
+
+    partition_input = {
+        "Values": partition_values,
+        "StorageDescriptor": {
+            "Location": partition_location,
+            "InputFormat": TEXT_INPUT_FORMAT,
+            "OutputFormat": TEXT_OUTPUT_FORMAT,
+            "Compressed": False,
+            "NumberOfBuckets": 0,
+            "SerdeInfo": serde,
+        },
+    }
+    try:
+        glue_client.create_partition(
+            DatabaseName=database_name, TableName=table_name, PartitionInput=partition_input)
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "AlreadyExistsException":
+            print("Partition already exists. Skipping insertion safely.")
+        else:
+            # Re-raise any other unexpected AWS errors (e.g., EntityNotFoundException)
+            raise e
+
+
+def format_to_athena_array(val):
+    """
+    Convert whatever the source has ("[1, 2]", "['1','2']", "{1,2}", a list, NaN)
+    into 'a|b|c' so Athena's LazySimpleSerDe (collection.delim='|') reads it as
+    array<string>. Empty / missing -> '' (Athena returns NULL/empty array).
+    """
+    if isinstance(val, (list, tuple, set)):
+        items = [str(v) for v in val]
+    else:
+        if val is None or pd.isna(val):
+            return ""
+        s = str(val)
+        # tokens = anything that isn't whitespace, comma, bracket, brace, quote, pipe, backslash
+        items = re.findall(r"[^\s,\[\]{}'\"|;\\]+", s)
+
+    items = [i for i in items if i and i.lower() not in ("nan", "none", "null")]
+    return ARRAY_DELIM.join(items)
+
+
+def map_round_numbers(
+    event_df: pd.DataFrame,
+    rounds_summary: pd.DataFrame,
+    game_id_col: str = "platformGameId",
+    time_col: str = "wallTime",
+) -> pd.DataFrame:
+    if event_df.empty:
+        return event_df
+
+    original_cols = event_df.columns.tolist()
+    if "roundNumber" not in original_cols:
+        original_cols.append("roundNumber")
+
+    event_sorted = event_df.sort_values(time_col)
+    rounds_sorted = rounds_summary.sort_values("min_wall_time")
+
+    merged = pd.merge_asof(
+        event_sorted,
+        rounds_sorted,
+        left_on=time_col,
+        right_on="min_wall_time",
+        left_by=game_id_col,
+        right_by="platformGameId",
+        direction="backward",
+    )
+
+    matched_round_col = (
+        "roundNumber_y" if "roundNumber_y" in merged.columns else "roundNumber"
+    )
+
+    merged["roundNumber"] = np.where(
+        merged[time_col] <= merged["max_wall_time"],
+        merged[matched_round_col],
+        np.nan,
+    )
+
+    return merged[original_cols]
+
+
+def process_game(league, year, game_id, players_df, teams_df):
+    print(f"Processing game ID: {game_id}")
+    text_base_dir = "eventsData/text"
+
+    # Input S3 paths
+    config_key = f"{text_base_dir}/configuration/league={league}/year={year}/{game_id}:configuration.txt"
+    rounds_started_key = f"{text_base_dir}/rounds_started/league={league}/year={year}/{game_id}:rounds_started.txt"
+    rounds_decided_key = f"{text_base_dir}/rounds_decided/league={league}/year={year}/{game_id}:rounds_decided.txt"
+    damage_key = f"{text_base_dir}/damageEvent/league={league}/year={year}/{game_id}:damageEvent.txt"
+    died_key = f"{text_base_dir}/playerDied/league={league}/year={year}/{game_id}:playerDied.txt"
+    spike_key = f"{text_base_dir}/spikeStatus/league={league}/year={year}/{game_id}:spikeStatus.txt"
+
+    # 1. Process Player Configuration & Enrichment
+    configuration = read_csv_from_s3(BUCKET_NAME, config_key, dtype=str)
+    if configuration is not None and not configuration.empty:
+        game_wise_players_config = (
+            pd.merge(
+                configuration,
+                players_df,
+                how='left',
+                left_on=['platform_id', 'player_key'],
+                right_on=['platformGameId', 'playerKey']
+            )
+            .drop(columns=['platformGameId'], errors='ignore')
+            .merge(
+                teams_df,
+                how='left',
+                left_on=['platform_id', 'team_key'],
+                right_on=['platformGameId', 'teamKey']
+            )
+            .drop(columns=['playerKey', 'league_x', 'teamKey', 'league_y'], errors='ignore')
+            .rename(columns={"teamId": "current_game_team_id", "playerId": "player_id"})
+        )
+        players_output_key = f"{text_base_dir}/game_players_event/league={league}/year={year}/{game_id}:players.txt"
+        write_df_to_s3(game_wise_players_config, BUCKET_NAME, players_output_key, "game_players_event")
+
+    # 2. Build Rounds Summary for AsOf Merge & Merge Rounds Event Output
+    rounds_started = read_csv_from_s3(BUCKET_NAME, rounds_started_key, dtype=str)
+    rounds_ended = read_csv_from_s3(BUCKET_NAME, rounds_decided_key, dtype=str)
+
+    if rounds_started is not None or rounds_ended is not None:
+        rounds_list = []
+        if rounds_started is not None and not rounds_started.empty:
+            rounds_list.append(rounds_started)
+        if rounds_ended is not None and not rounds_ended.empty:
+            rounds_list.append(rounds_ended)
+
+        rounds = pd.concat(rounds_list, ignore_index=True)
+
+        # Write merged rounds event output (wallTime normalized inside write_df_to_s3)
+        rounds_output_key = f"{text_base_dir}/roundsEventUpdated/league={league}/year={year}/{game_id}:roundsEventUpdated.txt"
+        write_df_to_s3(rounds, BUCKET_NAME, rounds_output_key, "game_rounds_event")
+
+        # utc=True keeps every wallTime tz-aware UTC so merge_asof keys always match
+        rounds['wallTime'] = pd.to_datetime(rounds['wallTime'], format='ISO8601', utc=True)
+        rounds['roundNumber'] = pd.to_numeric(rounds['roundNumber'], errors='coerce')
+
+        rounds_sorted = (
+            rounds
+            .groupby(['platform_id', 'roundNumber'])['wallTime']
+            .agg(min_wall_time='min', max_wall_time='max')
+            .reset_index()
+            .rename(columns={'platform_id': 'platformGameId'})
+            .sort_values(by=["platformGameId", "roundNumber"])
+        )
+        rounds_summary = rounds_sorted.sort_values('min_wall_time')
+
+        # 3. Process Damage Event Update
+        damageEvent = read_csv_from_s3(BUCKET_NAME, damage_key, dtype=str)
+        if damageEvent is not None and not damageEvent.empty:
+            damageEvent['wallTime'] = pd.to_datetime(damageEvent['wallTime'], format='ISO8601', utc=True)
+            damageEvent['roundNumber'] = pd.to_numeric(damageEvent['roundNumber'], errors='coerce')
+            damageEvent = damageEvent.sort_values('wallTime')
+            damageEvent = map_round_numbers(
+                damageEvent, rounds_summary, game_id_col="platform_id"
+            )
+            damage_output_key = f"{text_base_dir}/damageEvent_updated/league={league}/year={year}/{game_id}:damageEvent_updated.txt"
+            write_df_to_s3(damageEvent, BUCKET_NAME, damage_output_key, "game_damage_event")
+
+        # 4. Process Player Died Update
+        playerDied = read_csv_from_s3(
+            BUCKET_NAME,
+            died_key,
+            dtype=str,
+            quoting=csv.QUOTE_NONE,
+            escapechar="\\"
+        )
+        if playerDied is not None and not playerDied.empty:
+            playerDied['wallTime'] = pd.to_datetime(playerDied['wallTime'], format='ISO8601', utc=True)
+            playerDied['roundNumber'] = pd.to_numeric(playerDied['roundNumber'], errors='coerce')
+            playerDied = playerDied.sort_values('wallTime')
+            playerDied = map_round_numbers(
+                playerDied, rounds_summary, game_id_col="platform_id"
+            )
+            # assistants -> "a|b|c" so Athena (LazySimpleSerDe) reads array<string>
+            playerDied["assistants"] = playerDied["assistants"].apply(format_to_athena_array)
+            died_output_key = f"{text_base_dir}/playerDied_updated/league={league}/year={year}/{game_id}:playerDied_updated.txt"
+            write_df_to_s3(
+                playerDied,
+                BUCKET_NAME,
+                died_output_key,
+                "game_player_died_event",
+                quoting=csv.QUOTE_NONE,
+                escapechar="\\"
+            )
+
+        # 5. Process Spike Status Update
+        spikeStatus = read_csv_from_s3(BUCKET_NAME, spike_key, dtype=str)
+        if spikeStatus is not None and not spikeStatus.empty:
+            spikeStatus['wallTime'] = pd.to_datetime(spikeStatus['wallTime'], format='ISO8601', utc=True)
+            spikeStatus['roundNumber'] = pd.to_numeric(spikeStatus['roundNumber'], errors='coerce')
+            spikeStatus = spikeStatus.sort_values('wallTime')
+            spikeStatus = map_round_numbers(
+                spikeStatus, rounds_summary, game_id_col="platform_id"
+            )
+            spike_output_key = f"{text_base_dir}/spikeStatus_updated/league={league}/year={year}/{game_id}:spikeStatus_updated.txt"
+            write_df_to_s3(spikeStatus, BUCKET_NAME, spike_output_key, "game_spike_status_event")
+
+
+def lambda_handler(event, context):
+    path = event['detail']['message'].replace("Text Extracted : ", "").strip()
+    league = path.split("/", -1)[1]
+    YEAR = path.split("/", -1)[3]
+    game_id = path.split("/", -1)[4].rsplit(".")[0]
+
+    players_key = f"intermediateData/{league}/esports-data/players_enriched.csv"
+    teams_key = f"intermediateData/{league}/esports-data/teams_enriched.csv"
+
+    print(f"Loading enriched data for league: {league}")
+    players_df = read_csv_from_s3(BUCKET_NAME, players_key, dtype=str)
+    teams_df = read_csv_from_s3(BUCKET_NAME, teams_key, dtype=str)
+
+    if players_df is None or teams_df is None:
+        print(f"Error: Required lookup files missing for league {league}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Game event round mapping and enrichment failed!')
+        }
+
+    json_base_prefix = f"eventsData/json/league={league}/year={YEAR}"
+    try:
+        process_game(league, YEAR, game_id, players_df, teams_df)
+    except Exception as e:
+        print(f"Error processing game {game_id}: {str(e)}")
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Game event round mapping and enrichment complete!')
+    }

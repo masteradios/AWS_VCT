@@ -1,0 +1,80 @@
+import json
+import boto3
+from collections import defaultdict
+
+# Initialize S3 client
+s3_client = boto3.client('s3')
+
+BUCKET_NAME = "aws-vct"
+
+COMMON_KEYS = {"platformGameId", "metadata"}
+REQUIRED_EVENT_TYPES = {
+    'configuration', 'damageEvent', 'gameDecided', 'gamePhase',
+    'playerDied', 'roundCeremony', 'roundDecided', 'roundStarted',
+    'snapshot', 'spikeStatus'
+}
+
+
+def process_game_file(league, key,year):
+    filename = key.split('/')[-1]
+
+    # Match 'val:*.json' pattern
+    if not (filename.startswith('val:') and filename.endswith('.json')):
+        return
+
+    game_id = filename.replace('val:', '').replace('.json', '')
+    print(f"Processing game: {filename} (ID: {game_id})")
+
+    # Read JSON file from S3
+    response = s3_client.get_object(Bucket=BUCKET_NAME, Key=key)
+    events = json.loads(response['Body'].read().decode('utf-8'))
+
+    # Categorize events by type
+    events_by_type = defaultdict(list)
+    for e in events:
+        event_keys = set(e.keys()) - COMMON_KEYS
+        if len(event_keys) == 1:
+            events_by_type[event_keys.pop()].append(e)
+        else:
+            events_by_type["_unrecognized"].append(e)
+
+    # Write required event files to S3 results path
+    for etype, evs in events_by_type.items():
+        if etype == "_unrecognized" or etype not in REQUIRED_EVENT_TYPES:
+            continue
+
+        output_key = f"eventsData/json/league={league}/year={year}/val:{game_id}:{etype}.json"
+        s3_client.put_object(
+            Bucket=BUCKET_NAME,
+            Key=output_key,
+            Body=json.dumps(evs, indent=2),
+            ContentType='application/json'
+        )
+
+
+def lambda_handler(event, context):
+    key= event['detail']['object']['key']
+    parts = key.split('/')
+    league = parts[1] 
+    year = parts[3] 
+    try:
+        process_game_file(league, key,year)
+    except Exception as e:
+        print(f"Error processing s3://{BUCKET_NAME}/{key}: {str(e)}")
+    client = boto3.client('events')
+    response = client.put_events(   
+    Entries=[
+        {
+           
+            'Source': 'extract.events.json',
+            'DetailType': 'JSON Events Extraction',
+            'Detail': json.dumps({'message': f"Json Extracted : {key}"}),
+            'EventBusName': 'default',
+            
+        },
+    ]
+    )                
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Game event filtering complete!')
+    }

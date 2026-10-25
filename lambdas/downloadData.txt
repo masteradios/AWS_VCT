@@ -1,0 +1,139 @@
+import json
+import gzip
+import os
+import urllib.request
+import boto3
+from botocore.exceptions import ClientError
+
+# Initialize AWS S3 client
+s3_client = boto3.client("s3")
+
+# Source S3 endpoint
+S3_BUCKET_URL = "https://vcthackathon-data.s3.us-west-2.amazonaws.com"
+
+LEAGUE = "game-changers"
+YEAR = 2024
+
+# Destination S3 Bucket name retrieved from Lambda Environment Variables
+TARGET_BUCKET = "aws-vct"
+
+
+def object_exists_in_s3(bucket, key):
+    """Checks if an object already exists in the destination S3 bucket."""
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        raise e
+
+
+def download_gzip_and_write_to_s3(file_path):
+    """Downloads gzipped JSON from remote source, decompresses in memory, and uploads to S3."""
+    s3_key = f"rawData/{file_path}.json"
+    
+    # Check if object already exists in destination bucket
+    if object_exists_in_s3(TARGET_BUCKET, s3_key):
+        print(f"Skipping {s3_key}, already exists in target bucket.")
+        return False
+
+    remote_url = f"{S3_BUCKET_URL}/{file_path}.json.gz"
+    
+    try:
+        req = urllib.request.Request(remote_url)
+        with urllib.request.urlopen(req) as response:
+            if response.status == 200:
+                compressed_bytes = response.read()
+                decompressed_data = gzip.decompress(compressed_bytes)
+                
+                # Upload directly to destination S3 bucket
+                s3_client.put_object(
+                    Bucket=TARGET_BUCKET,
+                    Key=s3_key,
+                    Body=decompressed_data,
+                    ContentType='application/json'
+                )
+                print(f"Successfully uploaded: s3://{TARGET_BUCKET}/{s3_key}")
+                return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(f"Remote file not found (404): {remote_url}")
+            return False
+        print(f"HTTP Error {e.code} for {remote_url}")
+        return False
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
+        return False
+
+
+def download_esports_files():
+    directory = f"{LEAGUE}/esports-data"
+    esports_data_files = ["leagues", "tournaments", "players", "teams", "mapping_data"]
+    
+    for file_name in esports_data_files:
+        download_gzip_and_write_to_s3(f"{directory}/{file_name}")
+    
+    s3_client.put_object(
+                    Bucket=TARGET_BUCKET,
+                    Key=f"rawData/{directory}/.success",
+                    Body=b"",
+                    ContentType='application/json'
+                )
+
+
+def download_games(max_games_per_run=5):
+    # Fetch mapping data from target S3 bucket
+    mapping_s3_key = f"rawData/{LEAGUE}/esports-data/mapping_data.json"
+    
+    try:
+        response = s3_client.get_object(Bucket=TARGET_BUCKET, Key=mapping_s3_key)
+        mappings_data = json.loads(response['Body'].read().decode('utf-8'))
+    except ClientError as e:
+        print(f"Could not load mapping file '{mapping_s3_key}' from S3: {e}")
+        return 0
+
+    game_counter = 0
+
+    for esports_game in mappings_data:
+        platform_game_id = esports_game['platformGameId']
+        s3_game_file = f"{LEAGUE}/games/{YEAR}/{platform_game_id}"
+
+        downloaded = download_gzip_and_write_to_s3(s3_game_file)
+        
+        if downloaded:
+            game_counter += 1
+            if game_counter >= max_games_per_run:
+                print(f"Reached batch limit of {max_games_per_run} games for this invocation.")
+                break
+
+    s3_client.put_object(
+                    Bucket=TARGET_BUCKET,
+                    Key=f"rawData/{LEAGUE}/games/{YEAR}/.success.games",
+                    Body=b"",
+                    ContentType='application/json'
+                )    
+    return game_counter
+
+
+def lambda_handler(event, context):
+    if not TARGET_BUCKET:
+        return {
+            'statusCode': 500,
+            'body': json.dumps("Error: TARGET_BUCKET environment variable is missing.")
+        }
+
+    # Step 1: Download metadata files into rawData/
+    download_esports_files()
+    
+    # Step 2: Download game files into rawData/
+    games_processed=0
+    games_processed = download_games(max_games_per_run=5)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Execution complete',
+            'games_processed': games_processed
+        })
+    }
