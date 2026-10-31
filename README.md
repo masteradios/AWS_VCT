@@ -13,18 +13,22 @@ An AWS Bedrock–based agent that answers natural-language questions about VCT (
 
 ### Implementation Results :
 
-- 1.
+####  1\.  Which players assisted the most ?
+  
 <img width="1642" height="1015" alt="image4" src="https://github.com/user-attachments/assets/4af6c238-9253-4497-9644-3d31309cd584" />
 
-- 2.
+####  2\. Which player died the most ?
 <img width="1707" height="1017" alt="image1" src="https://github.com/user-attachments/assets/12abf0d9-c6aa-4323-8648-fb7dc7e25ce6" />
 
-- 3.
-<img width="1572" height="462" alt="image2" src="https://github.com/user-attachments/assets/48ff54d8-fc28-4f85-a4fa-b569d8b8b753" />
 
-- 4. 
+####  3\. is data of year 2020 available ? (For development, only years 2022,2023 and 2024 are available)
 
-<img width="1645" height="1016" alt="image3" src="https://github.com/user-attachments/assets/2da07102-2a6b-49cd-b0fc-68ed681a159b" />
+<img width="1616" height="656" alt="image6" src="https://github.com/user-attachments/assets/d16b8da9-5350-4888-9471-8f0bbe6c4c6d" />
+
+#### 4\. Try to delete rows (Strictly prohibited)
+
+<img width="1753" height="990" alt="image5" src="https://github.com/user-attachments/assets/b91bf043-a4af-40aa-b502-8f9ec505dac8" />
+
 
 
 ## Project Goal
