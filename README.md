@@ -6,7 +6,9 @@ An AWS Bedrock–based agent that answers natural-language questions about VCT (
 - **Bucket:** `aws-vct`
 - **Dataset docs:** [VCT hackathon data guide](https://docs.google.com/document/d/19H3FsWYEli6ShIV5_5fmhq2xDdfcQOCXlRiNvKZLYL8/edit?tab=t.0#heading=h.lkyo8c40dcz1)
 
-### Architecture Diagram :<img width="1302" height="862" alt="AWS_VCT" src="https://github.com/user-attachments/assets/5efc575e-c4a0-4b32-8adc-5071f03e5e42" />
+### Architecture Diagram :
+
+<img width="1302" height="862" alt="AWS_VCT" src="https://github.com/user-attachments/assets/5efc575e-c4a0-4b32-8adc-5071f03e5e42" />
 
 
 ## Project Goal
