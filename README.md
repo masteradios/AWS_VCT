@@ -13,9 +13,17 @@ An AWS Bedrock–based agent that answers natural-language questions about VCT (
 
 ### Implementation Results :
 
+- 1.
 <img width="1642" height="1015" alt="image4" src="https://github.com/user-attachments/assets/4af6c238-9253-4497-9644-3d31309cd584" />
+
+- 2.
 <img width="1707" height="1017" alt="image1" src="https://github.com/user-attachments/assets/12abf0d9-c6aa-4323-8648-fb7dc7e25ce6" />
+
+- 3.
 <img width="1572" height="462" alt="image2" src="https://github.com/user-attachments/assets/48ff54d8-fc28-4f85-a4fa-b569d8b8b753" />
+
+- 4. 
+
 <img width="1645" height="1016" alt="image3" src="https://github.com/user-attachments/assets/2da07102-2a6b-49cd-b0fc-68ed681a159b" />
 
 
